@@ -496,9 +496,19 @@ def _make_logits_processors(args):
 
 
 class ResponseGenerator:
-    def __init__(self, model_provider: ModelProvider, prompt_cache: LRUPromptCache):
+    def __init__(
+        self,
+        model_provider: ModelProvider,
+        prompt_cache: LRUPromptCache,
+        kv_bits: Optional[int] = None,
+        kv_group_size: int = 64,
+        quantized_kv_start: int = 5000,
+    ):
         self.model_provider = model_provider
         self.prompt_cache = prompt_cache
+        self.kv_bits = kv_bits
+        self.kv_group_size = kv_group_size
+        self.quantized_kv_start = quantized_kv_start
         self.requests = Queue()
 
         self._stop = False
@@ -658,6 +668,9 @@ class ResponseGenerator:
                         model,
                         stop_tokens=tokenizer.eos_token_ids,
                         prompt_progress_callback=progress_callback,
+                        kv_bits=self.kv_bits,
+                        kv_group_size=self.kv_group_size,
+                        quantized_kv_start=self.quantized_kv_start,
                     )
                     unprocessed_requests.append((rqueue, request, args))
                     continue
@@ -799,6 +812,9 @@ class ResponseGenerator:
                 draft_model=draft_model,
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
+                kv_bits=self.kv_bits,
+                kv_group_size=self.kv_group_size,
+                quantized_kv_start=self.quantized_kv_start,
             ):
                 top_tokens = None
                 if args.logprobs > 0:
@@ -1521,9 +1537,18 @@ def run(
     model_provider: ModelProvider,
     server_class=ThreadingHTTPServer,
     handler_class=APIHandler,
+    kv_bits: Optional[int] = None,
+    kv_group_size: int = 64,
+    quantized_kv_start: int = 5000,
 ):
     server_address = (host, port)
-    response_generator = ResponseGenerator(model_provider, LRUPromptCache())
+    response_generator = ResponseGenerator(
+        model_provider,
+        LRUPromptCache(),
+        kv_bits=kv_bits,
+        kv_group_size=kv_group_size,
+        quantized_kv_start=quantized_kv_start,
+    )
     infos = socket.getaddrinfo(
         *server_address, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
     )
@@ -1645,7 +1670,34 @@ def main():
         help="""A JSON formatted string of arguments for the tokenizer's apply_chat_template, e.g. '{"enable_thinking":false}'""",
         default="{}",
     )
+    parser.add_argument(
+        "--kv-bits",
+        type=int,
+        default=None,
+        help="Bits for KV cache quantization (4 or 8). Default: None (disabled)",
+    )
+    parser.add_argument(
+        "--kv-group-size",
+        type=int,
+        default=64,
+        help="Group size for KV cache quantization (default: 64)",
+    )
+    parser.add_argument(
+        "--quantized-kv-start",
+        type=int,
+        default=5000,
+        help="Start quantizing KV cache after this many tokens (default: 5000)",
+    )
     args = parser.parse_args()
+
+    # Validate KV cache quantization arguments
+    if args.kv_bits is not None and args.kv_bits not in (4, 8):
+        raise ValueError(f"--kv-bits must be 4 or 8, got {args.kv_bits}")
+    if args.kv_group_size <= 0:
+        raise ValueError(f"--kv-group-size must be positive, got {args.kv_group_size}")
+    if args.quantized_kv_start < 0:
+        raise ValueError(f"--quantized-kv-start must be non-negative, got {args.quantized_kv_start}")
+
     if mx.metal.is_available():
         wired_limit = mx.metal.device_info()["max_recommended_working_set_size"]
         mx.set_wired_limit(wired_limit)
@@ -1654,7 +1706,14 @@ def main():
         level=getattr(logging, args.log_level.upper(), None),
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
-    run(args.host, args.port, ModelProvider(args))
+    run(
+        args.host,
+        args.port,
+        ModelProvider(args),
+        kv_bits=args.kv_bits,
+        kv_group_size=args.kv_group_size,
+        quantized_kv_start=args.quantized_kv_start,
+    )
 
 
 if __name__ == "__main__":

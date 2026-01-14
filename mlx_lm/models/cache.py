@@ -303,6 +303,12 @@ class QuantizedKVCache(_BaseCache):
     def make_mask(self, *args, **kwargs):
         return create_attention_mask(*args, offset=self.offset, **kwargs)
 
+    @classmethod
+    def merge(cls, caches: List["QuantizedKVCache"]) -> "QuantizedBatchKVCache":
+        """Merge multiple QuantizedKVCache into a QuantizedBatchKVCache."""
+        # Forward to QuantizedBatchKVCache.merge
+        return QuantizedBatchKVCache.merge(caches)
+
 
 class KVCache(_BaseCache):
     step = 256
@@ -958,6 +964,392 @@ class BatchKVCache(_BaseCache):
         cache._idx = keys.shape[2]
 
         return cache
+
+
+class QuantizedBatchKVCache(_BaseCache):
+    """
+    A quantized KV cache for batched inference with left-padding support.
+
+    This cache quantizes keys and values using per-group quantization.
+    The quantized format stores tuples of (quantized_data, scales, biases)
+    for both keys and values.
+    """
+
+    step = 256
+
+    def __init__(self, left_padding: List[int], group_size: int = 64, bits: int = 8):
+        self.group_size = group_size
+        self.bits = bits
+        self.left_padding = mx.array(left_padding)
+        self.keys = None  # Tuple: (quantized, scales, biases)
+        self.values = None  # Tuple: (quantized, scales, biases)
+        self.offset = mx.array([-l for l in left_padding])
+        self._idx = 0
+        self._right_padding = None
+
+    def update_and_fetch(self, keys, values):
+        B, n_kv_heads, num_steps, k_head_dim = keys.shape
+        v_head_dim = values.shape[-1]
+        prev = self._idx
+
+        if self.keys is None or (prev + num_steps) > self.keys[0].shape[-2]:
+            el_per_int = 8 * mx.uint32.size // self.bits
+            new_steps = (self.step + num_steps - 1) // self.step * self.step
+            shape = (B, n_kv_heads, new_steps)
+
+            def init_quant(dim):
+                return (
+                    mx.zeros((*shape, dim // el_per_int), dtype=mx.uint32),
+                    mx.zeros((*shape, dim // self.group_size), dtype=keys.dtype),
+                    mx.zeros((*shape, dim // self.group_size), dtype=keys.dtype),
+                )
+
+            def expand_quant(x):
+                new_x = mx.zeros((*shape, x.shape[-1]), dtype=x.dtype)
+                return mx.concatenate([x, new_x], axis=-2)
+
+            if self.keys is not None:
+                if prev % self.step != 0:
+                    self.keys, self.values = tree_map(
+                        lambda x: x[..., :prev, :], (self.keys, self.values)
+                    )
+                self.keys, self.values = tree_map(
+                    expand_quant, (self.keys, self.values)
+                )
+            else:
+                self.keys, self.values = init_quant(k_head_dim), init_quant(v_head_dim)
+
+        self.offset += num_steps
+        self._idx += num_steps
+
+        qk = mx.quantize(keys, group_size=self.group_size, bits=self.bits)
+        qv = mx.quantize(values, group_size=self.group_size, bits=self.bits)
+        for i in range(3):
+            self.keys[i][..., prev : self._idx, :] = qk[i]
+            self.values[i][..., prev : self._idx, :] = qv[i]
+
+        return tree_map(lambda x: x[..., : self._idx, :], (self.keys, self.values))
+
+    def __len__(self):
+        return self._idx
+
+    def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
+        if left_padding is not None:
+            if self.keys is not None:
+                raise ValueError(
+                    "Left padding can only be added to an empty QuantizedBatchKVCache"
+                )
+            left_padding = mx.array(left_padding)
+            self.left_padding += left_padding
+            self.offset -= left_padding
+
+        if right_padding is not None and max(right_padding) > 0:
+            self._right_padding = mx.array(right_padding)
+
+    def finalize(self):
+        if self._right_padding is not None:
+            padding = self._right_padding
+            self.keys = tree_map(
+                lambda x: dynamic_roll(x, padding[:, None], axis=2), self.keys
+            )
+            self.values = tree_map(
+                lambda x: dynamic_roll(x, padding[:, None], axis=2), self.values
+            )
+            self.offset -= padding
+            self.left_padding += padding
+            self._right_padding = None
+
+    @property
+    def state(self):
+        k, v = self.keys, self.values
+        if self._idx < k[0].shape[2]:
+            k = tree_map(lambda x: x[..., : self._idx, :], k)
+            v = tree_map(lambda x: x[..., : self._idx, :], v)
+        return k, v, self.offset, self.left_padding
+
+    @state.setter
+    def state(self, v):
+        self.keys, self.values, self.offset, self.left_padding = v
+        self._idx = self.keys[0].shape[2]
+
+    @property
+    def meta_state(self):
+        return tuple(map(str, (self.group_size, self.bits)))
+
+    @meta_state.setter
+    def meta_state(self, v):
+        self.group_size, self.bits = map(int, v)
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self._idx, n)
+        self._idx -= n
+        self.offset -= n
+        return n
+
+    def make_mask(self, N: int, return_array: bool = False, **kwargs):
+        return create_causal_mask(
+            N, offset=self._idx, left_padding=self.left_padding, **kwargs
+        )
+
+    def filter(self, batch_indices):
+        """In-place filter to keep just the given indices in the cache."""
+        self.keys = tree_map(lambda x: x[batch_indices], self.keys)
+        self.values = tree_map(lambda x: x[batch_indices], self.values)
+        self.offset = self.offset[batch_indices]
+        self.left_padding = self.left_padding[batch_indices]
+
+        min_left_pad = self.left_padding.min().item()
+        if min_left_pad > 0:
+            self.keys = tree_map(lambda x: x[..., min_left_pad:, :], self.keys)
+            self.values = tree_map(lambda x: x[..., min_left_pad:, :], self.values)
+            self._idx -= min_left_pad
+            self.left_padding -= min_left_pad
+
+    def extend(self, other: "QuantizedBatchKVCache"):
+        """In-place extend this cache with another cache."""
+        max_idx = max(self._idx, other._idx)
+        max_size = max(self.keys[0].shape[2], other.keys[0].shape[2])
+
+        def pad(c):
+            left = max_idx - c._idx
+            right = max_size - c.keys[0].shape[2] - left
+
+            def pad_array(arr):
+                if right < 0:
+                    arr = arr[..., :right, :]
+                if left != 0 or right > 0:
+                    pads = [(0, 0), (0, 0), (left, max(0, right)), (0, 0)]
+                    arr = mx.pad(arr, pads)
+                return arr
+
+            k = tree_map(pad_array, c.keys)
+            v = tree_map(pad_array, c.values)
+            left_padding = c.left_padding + left
+            return k, v, c.offset, left_padding
+
+        k1, v1, o1, lp1 = pad(self)
+        k2, v2, o2, lp2 = pad(other)
+
+        self.keys = tree_map(lambda a, b: mx.concatenate([a, b]), k1, k2)
+        self.values = tree_map(lambda a, b: mx.concatenate([a, b]), v1, v2)
+        self.offset = mx.concatenate([o1, o2])
+        self.left_padding = mx.concatenate([lp1, lp2])
+        self._idx = max_idx
+
+    def extract(self, idx: int) -> "QuantizedKVCache":
+        """Extract a single element's cache as a standalone QuantizedKVCache."""
+        cache = QuantizedKVCache(group_size=self.group_size, bits=self.bits)
+        padding = self.left_padding[idx].item()
+        cache.keys = tuple(
+            mx.contiguous(arr[idx : idx + 1, :, padding : self._idx])
+            for arr in self.keys
+        )
+        cache.values = tuple(
+            mx.contiguous(arr[idx : idx + 1, :, padding : self._idx])
+            for arr in self.values
+        )
+        cache.offset = self.offset[idx].item()
+        return cache
+
+    @classmethod
+    def merge(cls, caches: List["QuantizedKVCache"]) -> "QuantizedBatchKVCache":
+        """Merge multiple QuantizedKVCache into QuantizedBatchKVCache."""
+        offsets = [c.offset for c in caches]
+        max_offset = max(offsets)
+        padding = [max_offset - o for o in offsets]
+
+        sample = next(c for c in caches if c.keys is not None)
+        B = len(caches)
+        H = sample.keys[0].shape[1]
+
+        batch_cache = cls(padding, group_size=sample.group_size, bits=sample.bits)
+
+        # Get dimensions from first cache
+        el_per_int = 8 * mx.uint32.size // sample.bits
+        k_head_dim = sample.keys[0].shape[3] * el_per_int
+        v_head_dim = sample.values[0].shape[3] * el_per_int
+        shape = (B, H, max_offset)
+
+        def init_batch_quant(dim):
+            return (
+                mx.zeros((*shape, dim // el_per_int), dtype=mx.uint32),
+                mx.zeros((*shape, dim // sample.group_size), dtype=sample.keys[1].dtype),
+                mx.zeros((*shape, dim // sample.group_size), dtype=sample.keys[2].dtype),
+            )
+
+        batch_cache.keys = init_batch_quant(k_head_dim)
+        batch_cache.values = init_batch_quant(v_head_dim)
+
+        for i, (p, c) in enumerate(zip(padding, caches)):
+            if c.keys is not None:
+                for j in range(3):
+                    batch_cache.keys[j][i : i + 1, :, p : p + c.offset] = c.keys[j][
+                        ..., : c.offset, :
+                    ]
+                    batch_cache.values[j][i : i + 1, :, p : p + c.offset] = c.values[j][
+                        ..., : c.offset, :
+                    ]
+
+        batch_cache.offset = mx.array(offsets)
+        batch_cache._idx = max_offset
+
+        return batch_cache
+
+
+class HybridBatchKVCache(_BaseCache):
+    """
+    A hybrid cache that starts unquantized and converts to quantized after threshold.
+
+    This provides better quality for early tokens while saving memory for
+    long sequences.
+
+    Note: `bits` and `group_size` are only exposed after quantization to ensure
+    the attention dispatch uses the correct path (quantized vs non-quantized).
+    """
+
+    def __init__(
+        self,
+        left_padding: List[int],
+        group_size: int = 64,
+        bits: int = 8,
+        quantized_kv_start: int = 5000,
+    ):
+        self._inner_cache = BatchKVCache(left_padding)
+        self._group_size = group_size
+        self._bits = bits
+        self.quantized_kv_start = quantized_kv_start
+        self._is_quantized = False
+
+    @property
+    def bits(self):
+        """Only expose bits when quantized, so attention dispatch works correctly."""
+        if self._is_quantized:
+            return self._inner_cache.bits
+        raise AttributeError("bits not available before quantization")
+
+    @property
+    def group_size(self):
+        """Only expose group_size when quantized."""
+        if self._is_quantized:
+            return self._inner_cache.group_size
+        raise AttributeError("group_size not available before quantization")
+
+    def update_and_fetch(self, keys, values):
+        result = self._inner_cache.update_and_fetch(keys, values)
+        if not self._is_quantized and self._should_quantize():
+            self._convert_to_quantized()
+            # Return quantized format after conversion
+            idx = self._inner_cache._idx
+            return (
+                tuple(x[..., :idx, :] for x in self._inner_cache.keys),
+                tuple(x[..., :idx, :] for x in self._inner_cache.values),
+            )
+        return result
+
+    def _should_quantize(self):
+        # Quantize when ALL batch elements exceed threshold
+        min_offset = self._inner_cache.offset.min().item()
+        return min_offset >= self.quantized_kv_start
+
+    def _convert_to_quantized(self):
+        """Convert BatchKVCache -> QuantizedBatchKVCache in-place."""
+        inner = self._inner_cache
+        quantized = QuantizedBatchKVCache(
+            inner.left_padding.tolist(),
+            group_size=self._group_size,
+            bits=self._bits,
+        )
+        quantized.keys = mx.quantize(
+            inner.keys[..., : inner._idx, :],
+            group_size=self._group_size,
+            bits=self._bits,
+        )
+        quantized.values = mx.quantize(
+            inner.values[..., : inner._idx, :],
+            group_size=self._group_size,
+            bits=self._bits,
+        )
+        quantized.offset = inner.offset
+        quantized._idx = inner._idx
+        quantized.left_padding = inner.left_padding
+        self._inner_cache = quantized
+        self._is_quantized = True
+
+    def extract(self, idx):
+        """Extract returns QuantizedKVCache if quantized, KVCache otherwise."""
+        return self._inner_cache.extract(idx)
+
+    @property
+    def offset(self):
+        return self._inner_cache.offset
+
+    @property
+    def _idx(self):
+        return self._inner_cache._idx
+
+    @property
+    def left_padding(self):
+        return self._inner_cache.left_padding
+
+    @property
+    def keys(self):
+        return self._inner_cache.keys
+
+    @property
+    def values(self):
+        return self._inner_cache.values
+
+    @property
+    def state(self):
+        return self._inner_cache.state
+
+    @state.setter
+    def state(self, v):
+        self._inner_cache.state = v
+
+    @property
+    def meta_state(self):
+        inner_meta = self._inner_cache.meta_state
+        return (str(self._is_quantized), str(self._group_size), str(self._bits),
+                str(self.quantized_kv_start)) + (inner_meta if inner_meta else ())
+
+    @meta_state.setter
+    def meta_state(self, v):
+        self._is_quantized = v[0] == "True"
+        self._group_size = int(v[1])
+        self._bits = int(v[2])
+        self.quantized_kv_start = int(v[3])
+        if len(v) > 4:
+            self._inner_cache.meta_state = v[4:]
+
+    def __len__(self):
+        return len(self._inner_cache)
+
+    def is_trimmable(self):
+        return self._inner_cache.is_trimmable()
+
+    def trim(self, n):
+        return self._inner_cache.trim(n)
+
+    def make_mask(self, *args, **kwargs):
+        return self._inner_cache.make_mask(*args, **kwargs)
+
+    def prepare(self, **kwargs):
+        return self._inner_cache.prepare(**kwargs)
+
+    def finalize(self):
+        return self._inner_cache.finalize()
+
+    def filter(self, batch_indices):
+        return self._inner_cache.filter(batch_indices)
+
+    def extend(self, other):
+        if isinstance(other, HybridBatchKVCache):
+            return self._inner_cache.extend(other._inner_cache)
+        return self._inner_cache.extend(other)
 
 
 class BatchRotatingKVCache(_BaseCache):

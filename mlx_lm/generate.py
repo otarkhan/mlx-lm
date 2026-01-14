@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import functools
 import json
+import logging
 import sys
 import time
 from dataclasses import dataclass
@@ -29,7 +30,9 @@ from .models.cache import (
     BatchKVCache,
     BatchRotatingKVCache,
     CacheList,
+    HybridBatchKVCache,
     KVCache,
+    QuantizedBatchKVCache,
     QuantizedKVCache,
     RotatingKVCache,
     load_prompt_cache,
@@ -354,6 +357,9 @@ def generate_step(
         raise ValueError(
             "Either input_embeddings or prompt (or both) must be provided."
         )
+
+    if kv_bits is not None and kv_bits not in (4, 8):
+        raise ValueError(f"kv_bits must be 4 or 8, got {kv_bits}")
 
     tokens = None
 
@@ -877,14 +883,30 @@ class Batch:
         return [c.extract(idx) for c in self.cache]
 
 
-def _make_cache(model, left_padding):
+def _make_cache(
+    model,
+    left_padding,
+    kv_bits: Optional[int] = None,
+    kv_group_size: int = 64,
+    quantized_kv_start: int = 5000,
+):
     """
     Convert a list of regular caches into their corresponding
     batch-aware caches.
+
+    If kv_bits is provided, creates HybridBatchKVCache that will convert
+    to quantized after quantized_kv_start tokens.
     """
 
     def to_batch_cache(c):
         if type(c) is KVCache:
+            if kv_bits is not None:
+                return HybridBatchKVCache(
+                    left_padding,
+                    group_size=kv_group_size,
+                    bits=kv_bits,
+                    quantized_kv_start=quantized_kv_start,
+                )
             return BatchKVCache(left_padding)
         elif isinstance(c, ArraysCache):
             c.left_padding = mx.array(left_padding)
@@ -892,6 +914,11 @@ def _make_cache(model, left_padding):
         elif isinstance(c, RotatingKVCache):
             if c.keep > 0:
                 raise ValueError("RotatingKVCache with keep tokens is not supported.")
+            if kv_bits is not None:
+                logging.warning(
+                    "KV cache quantization is not supported with RotatingKVCache. "
+                    "Falling back to unquantized cache."
+                )
             return BatchRotatingKVCache(c.max_size, left_padding)
         elif isinstance(c, CacheList):
             return CacheList(*(to_batch_cache(sub_c) for sub_c in c.caches))
@@ -902,17 +929,49 @@ def _make_cache(model, left_padding):
         cache = model.make_cache()
         return [to_batch_cache(c) for c in cache]
     else:
+        if kv_bits is not None:
+            return [
+                HybridBatchKVCache(
+                    left_padding,
+                    group_size=kv_group_size,
+                    bits=kv_bits,
+                    quantized_kv_start=quantized_kv_start,
+                )
+                for _ in model.layers
+            ]
         return [BatchKVCache(left_padding) for _ in model.layers]
 
 
 def _merge_caches(caches):
+    """Merge multiple cache lists into a batch cache list.
+
+    Handles mixed quantized/non-quantized caches by converting all to
+    quantized if any are quantized.
+    """
     batch_cache = []
     for i in range(len(caches[0])):
-        if hasattr(caches[0][i], "merge"):
-            batch_cache.append(caches[0][i].merge([c[i] for c in caches]))
+        layer_caches = [c[i] for c in caches]
+
+        # Check if we have mixed types (some quantized, some not)
+        has_quantized = any(isinstance(c, QuantizedKVCache) for c in layer_caches)
+        has_regular = any(isinstance(c, KVCache) for c in layer_caches)
+
+        if has_quantized and has_regular:
+            # Convert all regular KVCache to QuantizedKVCache
+            # Use params from first quantized cache
+            sample = next(c for c in layer_caches if isinstance(c, QuantizedKVCache))
+            layer_caches = [
+                c.to_quantized(group_size=sample.group_size, bits=sample.bits)
+                if isinstance(c, KVCache)
+                else c
+                for c in layer_caches
+            ]
+
+        if hasattr(layer_caches[0], "merge"):
+            batch_cache.append(layer_caches[0].merge(layer_caches))
         else:
             raise ValueError(
-                f"{type(caches[0][i])} does not yet support batching with history"
+                f"{type(layer_caches[0])} does not yet support batching with history"
             )
     return batch_cache
 
@@ -941,6 +1000,9 @@ class BatchGenerator:
         prompt_progress_callback: Optional[
             Callable[[List[Tuple[int, int, int]]], None]
         ] = None,
+        kv_bits: Optional[int] = None,
+        kv_group_size: int = 64,
+        quantized_kv_start: int = 5000,
     ):
         self.model = model
         self.unprocessed_prompts = []
@@ -955,7 +1017,15 @@ class BatchGenerator:
         self.prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
         self._stats = BatchStats()
 
+        # KV cache quantization params
+        if kv_bits is not None and kv_bits not in (4, 8):
+            raise ValueError(f"kv_bits must be 4 or 8, got {kv_bits}")
+        self.kv_bits = kv_bits
+        self.kv_group_size = kv_group_size
+        self.quantized_kv_start = quantized_kv_start
+
         self.active_batch = None
+        self._generation_step_count = 0
 
         if mx.metal.is_available():
             self._old_wired_limit = mx.set_wired_limit(
@@ -1042,7 +1112,13 @@ class BatchGenerator:
         #   2. Process
         if cache_is_empty:
             inputs = _left_pad_prompts(inputs, max_length=max_length)
-            prompt_cache = _make_cache(self.model, padding)
+            prompt_cache = _make_cache(
+                self.model,
+                padding,
+                kv_bits=self.kv_bits,
+                kv_group_size=self.kv_group_size,
+                quantized_kv_start=self.quantized_kv_start,
+            )
 
             while inputs.shape[1] > 1:
                 n_to_process = min(self.prefill_step_size, inputs.shape[1] - 1)
@@ -1056,6 +1132,7 @@ class BatchGenerator:
                         for uid, length in zip(uids, lengths)
                     ]
                 )
+                mx.clear_cache()
 
         # Further prompt processing so we need to
         #   1. Merge the KV caches and prepare for right padded prompts
@@ -1168,6 +1245,8 @@ class BatchGenerator:
             # No more prompts and no more completions, all done
             elif len(prompts) == 0:
                 self.active_batch = None
+                self._generation_step_count = 0
+                mx.clear_cache()
                 return []
             # Process prompts
             if batch is not None and not prompt_processing:
@@ -1239,8 +1318,16 @@ class BatchGenerator:
                 batch.filter(keep_idx)
             else:
                 self.active_batch = None
+                self._generation_step_count = 0
+                mx.clear_cache()
 
         self._stats.generation_tokens += len(responses)
+
+        # Periodic cache clearing to prevent memory accumulation
+        self._generation_step_count += 1
+        if self._generation_step_count % 256 == 0:
+            mx.clear_cache()
+
         return responses
 
     def next(self):
